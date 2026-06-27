@@ -1,0 +1,263 @@
+<?php
+/**
+ * Database operations class for Link Healer.
+ */
+
+// Prevent direct access.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class Link_Healer_DB {
+
+	/**
+	 * Singleton instance.
+	 *
+	 * @var Link_Healer_DB
+	 */
+	private static $instance = null;
+
+	/**
+	 * Get active instance.
+	 *
+	 * @return Link_Healer_DB
+	 */
+	public static function get_instance() {
+		if ( null === self::$instance ) {
+			self::$instance = new self();
+		}
+		return self::$instance;
+	}
+
+	/**
+	 * Constructor.
+	 */
+	private function __construct() {}
+
+	/**
+	 * Install/create database tables on plugin activation.
+	 */
+	public static function install() {
+		global $wpdb;
+
+		$charset_collate = $wpdb->get_charset_collate();
+		$table_sources   = $wpdb->prefix . 'link_healer_sources';
+		$table_links     = $wpdb->prefix . 'link_healer_links';
+
+		// wp_link_healer_sources table SQL.
+		// Note the double spaces before PRIMARY KEY and KEY definitions as required by dbDelta.
+		$sql_sources = "CREATE TABLE $table_sources (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			post_id bigint(20) unsigned DEFAULT NULL,
+			source_type varchar(50) NOT NULL,
+			source_url varchar(2083) NOT NULL,
+			status varchar(20) DEFAULT 'pending' NOT NULL,
+			last_scanned datetime DEFAULT NULL,
+			PRIMARY KEY  (id),
+			KEY post_id (post_id),
+			KEY status (status),
+			KEY source_type (source_type),
+			KEY source_url (source_url(191))
+		) $charset_collate;";
+
+		// wp_link_healer_links table SQL.
+		$sql_links = "CREATE TABLE $table_links (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			source_id bigint(20) unsigned NOT NULL,
+			raw_url varchar(2083) NOT NULL,
+			url_hash char(32) NOT NULL,
+			link_type varchar(20) NOT NULL,
+			http_status int(5) DEFAULT NULL,
+			status varchar(20) DEFAULT 'unchecked' NOT NULL,
+			anchor_text text DEFAULT NULL,
+			suggested_fix varchar(2083) DEFAULT NULL,
+			last_checked datetime DEFAULT NULL,
+			PRIMARY KEY  (id),
+			UNIQUE KEY unique_link (source_id, raw_url(191)),
+			KEY source_id (source_id),
+			KEY status (status),
+			KEY url_hash (url_hash),
+			KEY http_status (http_status)
+		) $charset_collate;";
+
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		dbDelta( $sql_sources );
+		dbDelta( $sql_links );
+	}
+
+	/**
+	 * Insert or get existing source URL.
+	 *
+	 * @param int|null $post_id
+	 * @param string   $source_type
+	 * @param string   $source_url
+	 * @return int Source ID
+	 */
+	public function add_source( $post_id, $source_type, $source_url ) {
+		global $wpdb;
+		$table = $wpdb->prefix . 'link_healer_sources';
+
+		// Clean and trim URL.
+		$source_url = esc_url_raw( trim( $source_url ) );
+
+		// Check if it already exists to prevent duplicate sources.
+		$existing_id = $wpdb->get_var( $wpdb->prepare(
+			"SELECT id FROM $table WHERE source_url = %s",
+			$source_url
+		) );
+
+		if ( $existing_id ) {
+			return (int) $existing_id;
+		}
+
+		$wpdb->insert(
+			$table,
+			array(
+				'post_id'     => $post_id,
+				'source_type' => sanitize_key( $source_type ),
+				'source_url'  => $source_url,
+				'status'      => 'pending',
+			),
+			array(
+				'%d',
+				'%s',
+				'%s',
+				'%s',
+			)
+		);
+
+		return (int) $wpdb->insert_id;
+	}
+
+	/**
+	 * Update source scan status and timestamp.
+	 *
+	 * @param int    $source_id
+	 * @param string $status
+	 */
+	public function update_source_status( $source_id, $status ) {
+		global $wpdb;
+		$table = $wpdb->prefix . 'link_healer_sources';
+
+		$wpdb->update(
+			$table,
+			array(
+				'status'       => sanitize_key( $status ),
+				'last_scanned' => current_time( 'mysql' ),
+			),
+			array( 'id' => (int) $source_id ),
+			array( '%s', '%s' ),
+			array( '%d' )
+		);
+	}
+
+	/**
+	 * Insert/update link details under a specific source.
+	 *
+	 * @param int    $source_id
+	 * @param string $raw_url
+	 * @param string $link_type
+	 * @param string $anchor_text
+	 * @return int Link ID
+	 */
+	public function save_link( $source_id, $raw_url, $link_type, $anchor_text ) {
+		global $wpdb;
+		$table = $wpdb->prefix . 'link_healer_links';
+
+		$raw_url  = esc_url_raw( trim( $raw_url ) );
+		$url_hash = md5( $raw_url );
+
+		// Check if this source already has this exact link recorded.
+		$existing_id = $wpdb->get_var( $wpdb->prepare(
+			"SELECT id FROM $table WHERE source_id = %d AND url_hash = %s",
+			(int) $source_id,
+			$url_hash
+		) );
+
+		if ( $existing_id ) {
+			// Update the anchor text context in case it changed.
+			$wpdb->update(
+				$table,
+				array( 'anchor_text' => wp_kses_post( $anchor_text ) ),
+				array( 'id' => (int) $existing_id ),
+				array( '%s' ),
+				array( '%d' )
+			);
+			return (int) $existing_id;
+		}
+
+		$wpdb->insert(
+			$table,
+			array(
+				'source_id'   => (int) $source_id,
+				'raw_url'     => $raw_url,
+				'url_hash'    => $url_hash,
+				'link_type'   => sanitize_key( $link_type ),
+				'status'      => 'unchecked',
+				'anchor_text' => wp_kses_post( $anchor_text ),
+			),
+			array(
+				'%d',
+				'%s',
+				'%s',
+				'%s',
+				'%s',
+				'%s',
+			)
+		);
+
+		return (int) $wpdb->insert_id;
+	}
+
+	/**
+	 * Update validation results for a discovered link.
+	 *
+	 * @param int    $link_id
+	 * @param int    $http_status
+	 * @param string $status
+	 * @param string $suggested_fix
+	 */
+	public function update_link_status( $link_id, $http_status, $status, $suggested_fix = '' ) {
+		global $wpdb;
+		$table = $wpdb->prefix . 'link_healer_links';
+
+		$wpdb->update(
+			$table,
+			array(
+				'http_status'   => (int) $http_status,
+				'status'        => sanitize_key( $status ),
+				'suggested_fix' => esc_url_raw( $suggested_fix ),
+				'last_checked'  => current_time( 'mysql' ),
+			),
+			array( 'id' => (int) $link_id ),
+			array( '%d', '%s', '%s', '%s' ),
+			array( '%d' )
+		);
+	}
+
+	/**
+	 * Remove links for a specific source that were not found in the latest scan.
+	 *
+	 * @param int   $source_id
+	 * @param array $current_link_hashes Hashes of the links that were found in the current scan.
+	 */
+	public function purge_removed_links( $source_id, $current_link_hashes ) {
+		global $wpdb;
+		$table = $wpdb->prefix . 'link_healer_links';
+
+		if ( empty( $current_link_hashes ) ) {
+			// If no links were found in the latest scan, delete all links for this source.
+			$wpdb->delete( $table, array( 'source_id' => (int) $source_id ), array( '%d' ) );
+			return;
+		}
+
+		// Prepare placeholders for SQL IN clause.
+		$placeholders = implode( ',', array_fill( 0, count( $current_link_hashes ), '%s' ) );
+		$query        = $wpdb->prepare(
+			"DELETE FROM $table WHERE source_id = %d AND url_hash NOT IN ($placeholders)",
+			array_merge( array( (int) $source_id ), $current_link_hashes )
+		);
+
+		$wpdb->query( $query );
+	}
+}
