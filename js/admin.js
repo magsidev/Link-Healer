@@ -5,6 +5,11 @@
 	'use strict';
 
 	$(document).ready(function() {
+		// State tracking variables for cascading crawl loop
+		let isCrawling = false;
+		let crawlFailureCount = 0;
+		let totalPendingAtStart = 0;
+
 		// Unified Toast Notification Helper
 		function showToast(message, type) {
 			const toast = $('#link-healer-toast');
@@ -134,9 +139,6 @@
 					action: 'link_healer_get_status',
 					nonce: linkHealerAdmin.nonce
 				}, function() {
-					// We refresh using the status logic or reload to get clean state
-					// But we want to avoid reloads entirely:
-					// We can trigger an admin-ajax reload query
 					location.reload(); // Simple fallback if bulk needs full page pagination recalculation
 				});
 				return;
@@ -198,6 +200,11 @@
 				if (response.success) {
 					showToast(response.data.message, 'success');
 					updateDashboardUI(response.data);
+
+					// Automatically initiate recursive crawl loop if source URLs exist
+					if (response.data.remaining_pending > 0) {
+						setTimeout(startCrawlLoop, 800);
+					}
 				} else {
 					showToast(response.data.message, 'error');
 				}
@@ -207,27 +214,159 @@
 			});
 		});
 
-		// Trigger Crawl Manually (Asynchronous)
-		$(document).on('click', '#link-healer-trigger-crawl', function(e) {
-			e.preventDefault();
-			const button = $(this);
-			button.prop('disabled', true).append(' <span class="link-healer-spinner"></span>');
+		// Recursive AJAX Cascading Crawl Loop
+		function executeCrawlLoop() {
+			if (!isCrawling) {
+				return;
+			}
 
 			$.post(ajaxurl, {
 				action: 'link_healer_trigger_crawl',
 				nonce: linkHealerAdmin.nonce
 			}, function(response) {
-				button.prop('disabled', false).find('.link-healer-spinner').remove();
+				if (!isCrawling) {
+					return;
+				}
+
 				if (response.success) {
-					showToast(response.data.message, 'success');
-					updateDashboardUI(response.data);
+					const data = response.data;
+
+					// Initialize starting pending count on first loop iteration
+					if (totalPendingAtStart === 0) {
+						totalPendingAtStart = data.remaining_pending + data.processed_in_batch;
+					}
+
+					// Safeguard: repeated 0 item processes triggers backup break
+					if (data.processed_in_batch === 0 && data.remaining_pending > 0) {
+						crawlFailureCount++;
+						if (crawlFailureCount >= 3) {
+							showToast('Crawl loop paused to avoid server execution lock.', 'error');
+							stopCrawlLoop();
+							updateDashboardUI(data);
+							return;
+						}
+					} else {
+						crawlFailureCount = 0; // Reset safety tracking
+					}
+
+					// Update DOM widgets
+					updateDashboardUI(data);
+
+					if (data.remaining_pending > 0) {
+						// Calculate Phase-based progress to guarantee forward progression
+						let pct = 0;
+						let progressLabel = 'Crawling queue...';
+
+						const pendingSources = parseInt(data.pending_sources, 10) || 0;
+						const completedSources = parseInt(data.completed_sources, 10) || 0;
+						const totalSources = parseInt(data.total_sources, 10) || 0;
+
+						const uncheckedLinks = parseInt(data.unchecked_links, 10) || 0;
+						const totalLinks = parseInt(data.total_links, 10) || 0;
+
+						if (pendingSources > 0) {
+							// Phase 1: Source Crawling (0% to 50%)
+							const sourcePct = totalSources > 0 ? (completedSources / totalSources) : 0;
+							pct = Math.round(sourcePct * 50);
+							progressLabel = 'Crawling pages: ' + completedSources + ' / ' + totalSources;
+						} else {
+							// Phase 2: Link Verifying (50% to 100%)
+							const checkedLinks = totalLinks - uncheckedLinks;
+							const linkPct = totalLinks > 0 ? (checkedLinks / totalLinks) : 0;
+							pct = Math.round(50 + (linkPct * 50));
+							progressLabel = 'Verifying links: ' + checkedLinks + ' / ' + totalLinks;
+						}
+
+						pct = Math.max(0, Math.min(100, pct));
+
+						// Update Progress bar details
+						$('#link-healer-progress-label').text(progressLabel);
+						$('#link-healer-progress-percentage').text(pct + '%');
+						$('#link-healer-progress-bar').css('width', pct + '%');
+						$('#link-healer-progress-details').text('Remaining sources: ' + pendingSources + ' | Unchecked links: ' + uncheckedLinks);
+
+						// Trigger next recursive iteration
+						setTimeout(executeCrawlLoop, 200);
+					} else {
+						// Final completion
+						$('#link-healer-progress-label').text('Scan Complete!');
+						$('#link-healer-progress-percentage').text('100%');
+						$('#link-healer-progress-bar').css('width', '100%');
+						$('#link-healer-progress-details').text('All links and pages are fully verified.');
+						showToast('Auditing completed! 100% of links checked.', 'success');
+						stopCrawlLoop();
+					}
 				} else {
-					showToast(response.data.message, 'error');
+					crawlFailureCount++;
+					if (crawlFailureCount >= 3) {
+						showToast(response.data.message || 'Crawl failed due to repeated server exceptions.', 'error');
+						stopCrawlLoop();
+					} else {
+						setTimeout(executeCrawlLoop, 1000);
+					}
 				}
 			}).fail(function() {
-				button.prop('disabled', false).find('.link-healer-spinner').remove();
-				showToast('Crawl execution failed.', 'error');
+				if (!isCrawling) {
+					return;
+				}
+				crawlFailureCount++;
+				if (crawlFailureCount >= 3) {
+					showToast('Crawl aborted due to persistent network connection timeouts.', 'error');
+					stopCrawlLoop();
+				} else {
+					setTimeout(executeCrawlLoop, 2000);
+				}
 			});
+		}
+
+		function startCrawlLoop() {
+			isCrawling = true;
+			crawlFailureCount = 0;
+			totalPendingAtStart = 0;
+
+			// Show container progress bar
+			$('#link-healer-progress-container').show();
+			$('#link-healer-progress-label').text('Starting scanner...');
+			$('#link-healer-progress-percentage').text('0%');
+			$('#link-healer-progress-bar').css('width', '0%');
+			
+			// Toggle buttons
+			$('#link-healer-trigger-crawl').hide();
+			$('#link-healer-trigger-discovery').prop('disabled', true);
+			$('#link-healer-reset-data').prop('disabled', true);
+			$('#link-healer-cancel-crawl').show();
+
+			executeCrawlLoop();
+		}
+
+		function stopCrawlLoop() {
+			isCrawling = false;
+
+			// Reset buttons
+			$('#link-healer-cancel-crawl').hide();
+			$('#link-healer-trigger-crawl').show().prop('disabled', false);
+			$('#link-healer-trigger-discovery').prop('disabled', false);
+			$('#link-healer-reset-data').prop('disabled', false);
+
+			// Clean progress fade out
+			setTimeout(function() {
+				if (!isCrawling) {
+					$('#link-healer-progress-container').fadeOut();
+				}
+			}, 4000);
+		}
+
+		// Trigger Crawl Click Controller
+		$(document).on('click', '#link-healer-trigger-crawl', function(e) {
+			e.preventDefault();
+			startCrawlLoop();
+		});
+
+		// Cancel Crawl Click Controller
+		$(document).on('click', '#link-healer-cancel-crawl', function(e) {
+			e.preventDefault();
+			showToast('Auditing paused by user.', 'info');
+			stopCrawlLoop();
 		});
 
 		// Trigger Data Reset Manually (Asynchronous)

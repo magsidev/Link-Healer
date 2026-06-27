@@ -559,9 +559,25 @@ class Link_Healer_Admin {
 						<button id="link-healer-trigger-crawl" class="link-healer-btn link-healer-btn-secondary">
 							<span class="dashicons dashicons-update" style="margin-top:2px;"></span> <?php esc_html_e( 'Crawl Pending Links', 'link-healer' ); ?>
 						</button>
+						<button id="link-healer-cancel-crawl" class="link-healer-btn link-healer-btn-danger" style="display:none;">
+							<span class="dashicons dashicons-dismiss" style="margin-top:2px;"></span> <?php esc_html_e( 'Cancel Crawl', 'link-healer' ); ?>
+						</button>
 						<button id="link-healer-reset-data" class="link-healer-btn link-healer-btn-danger">
 							<span class="dashicons dashicons-trash" style="margin-top:2px;"></span> <?php esc_html_e( 'Reset Database', 'link-healer' ); ?>
 						</button>
+					</div>
+					<!-- Progress Tracker Container -->
+					<div id="link-healer-progress-container" style="display:none; margin-top: 15px; padding: 15px; background: rgba(0,0,0,0.02); border-radius: 8px;">
+						<div style="display: flex; justify-content: space-between; margin-bottom: 5px; font-weight: 500;">
+							<span id="link-healer-progress-label">Crawling...</span>
+							<span id="link-healer-progress-percentage">0%</span>
+						</div>
+						<div style="width: 100%; height: 10px; background: rgba(0,0,0,0.05); border-radius: 5px; overflow: hidden;">
+							<div id="link-healer-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%); transition: width 0.3s ease;"></div>
+						</div>
+						<div id="link-healer-progress-details" style="margin-top: 5px; font-size: 11px; opacity: 0.7;">
+							Remaining: 0 | Total: 0
+						</div>
 					</div>
 				</div>
 

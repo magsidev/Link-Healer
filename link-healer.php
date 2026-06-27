@@ -136,6 +136,14 @@ class Link_Healer {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'link-healer' ) ), 403 );
 		}
 
+		global $wpdb;
+		$table_sources = $wpdb->prefix . 'link_healer_sources';
+		$table_links   = $wpdb->prefix . 'link_healer_links';
+
+		// Get counts before running the batch
+		$completed_sources_before = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'completed'" );
+		$checked_links_before     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status != 'unchecked'" );
+
 		$cron      = Link_Healer_Cron::get_instance();
 		$processed = $cron->process_batch();
 
@@ -143,13 +151,38 @@ class Link_Healer {
 			wp_send_json_error( array( 'message' => __( 'Queue is locked or database error. Please wait.', 'link-healer' ) ) );
 		}
 
+		// Get counts after running the batch
+		$pending_sources   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'pending'" );
+		$completed_sources = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'completed'" );
+		$total_sources     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources" );
+
+		$unchecked_links = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'unchecked'" );
+		$checked_links   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status != 'unchecked'" );
+		$total_links     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links" );
+
+		$sources_diff = $completed_sources - $completed_sources_before;
+		$links_diff   = $checked_links - $checked_links_before;
+		
+		$processed_in_batch   = $sources_diff + $links_diff;
+		$remaining_pending    = $pending_sources + $unchecked_links;
+		
+		// Set total pending at start as the current remaining plus what we processed in this batch, if not tracked on frontend
+		$total_pending_at_start = $remaining_pending + $processed_in_batch;
+
 		$admin_data = Link_Healer_Admin::get_instance()->get_ajax_dashboard_data();
 
 		wp_send_json_success( array(
-			'message'    => sprintf( __( 'Processed batch of %d sources.', 'link-healer' ), $processed ),
-			'processed'  => $processed,
-			'kpis'       => $admin_data['kpis'],
-			'table_html' => $admin_data['table_html'],
+			'message'                => sprintf( __( 'Processed batch: %d sources, %d links.', 'link-healer' ), $sources_diff, $links_diff ),
+			'processed_in_batch'     => $processed_in_batch,
+			'remaining_pending'      => $remaining_pending,
+			'total_pending_at_start' => $total_pending_at_start,
+			'pending_sources'        => $pending_sources,
+			'completed_sources'      => $completed_sources,
+			'total_sources'          => $total_sources,
+			'unchecked_links'        => $unchecked_links,
+			'total_links'            => $total_links,
+			'kpis'                   => $admin_data['kpis'],
+			'table_html'             => $admin_data['table_html'],
 		) );
 	}
 
