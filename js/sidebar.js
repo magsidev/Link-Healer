@@ -58,7 +58,7 @@
 		 * @param {Object} link The link object from REST.
 		 */
 		function handleSwap( link ) {
-			var newUrl = suggestionValues[ link.id ] !== undefined ? suggestionValues[ link.id ] : link.suggested_fix;
+			var newUrl = suggestionValues[ link.id ] !== undefined ? suggestionValues[ link.id ] : link.suggested_fix_url;
 
 			if ( ! newUrl ) {
 				dispatch( 'core/notices' ).createErrorNotice( 'Please enter a valid target suggestion URL.' );
@@ -85,17 +85,17 @@
 							var attributeValue = block.attributes[ key ];
 
 							// Match 1: Exact matches (commonly button URLs, link block settings)
-							if ( attributeValue === link.raw_url ) {
+							if ( attributeValue === link.target_url ) {
 								newAttributes[ key ] = newUrl;
 								attributesChanged = true;
 								totalSwapped++;
 							}
 							// Match 2: Inline HTML hyperlink anchor tags inside contents (commonly Paragraph or List blocks)
 							else if (
-								attributeValue.indexOf( 'href="' + link.raw_url + '"' ) !== -1 ||
-								attributeValue.indexOf( "href='" + link.raw_url + "'" ) !== -1
+								attributeValue.indexOf( 'href="' + link.target_url + '"' ) !== -1 ||
+								attributeValue.indexOf( "href='" + link.target_url + "'" ) !== -1
 							) {
-								var escapedRaw = escapeRegExp( link.raw_url );
+								var escapedRaw = escapeRegExp( link.target_url );
 								var regexDouble = new RegExp( 'href="' + escapedRaw + '"', 'g' );
 								var regexSingle = new RegExp( "href='" + escapedRaw + "'", 'g' );
 
@@ -134,7 +134,7 @@
 				);
 			} else {
 				dispatch( 'core/notices' ).createWarningNotice(
-					'Could not locate any active block containing the URL: "' + link.raw_url + '" on the editor canvas.'
+					'Could not locate any active block containing the URL: "' + link.target_url + '" on the editor canvas.'
 				);
 			}
 		}
@@ -179,7 +179,7 @@
 					)
 					: links.map( function( link ) {
 						var isSwapped = swappedIds.indexOf( link.id ) !== -1;
-						var currentSuggestion = suggestionValues[ link.id ] !== undefined ? suggestionValues[ link.id ] : link.suggested_fix;
+						var currentSuggestion = suggestionValues[ link.id ] !== undefined ? suggestionValues[ link.id ] : link.suggested_fix_url;
 
 						return el(
 							'div',
@@ -216,7 +216,7 @@
 											marginTop: '4px',
 										},
 									},
-									link.raw_url
+									link.target_url
 								)
 							),
 							el(

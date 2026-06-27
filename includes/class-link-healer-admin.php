@@ -41,8 +41,9 @@ class Link_Healer_Admin {
 		// Hook save_post to auto-mark resolved links
 		add_action( 'save_post', array( $this, 'on_post_save' ), 10, 3 );
 
-		// Register the AJAX Link Healing endpoint
-		add_action( 'wp_ajax_link_healer_heal_link', array( $this, 'ajax_heal_link' ) );
+		// Register AJAX endpoints (lh_ namespace)
+		add_action( 'wp_ajax_lh_heal_link', array( $this, 'ajax_heal_link' ) );
+		add_action( 'wp_ajax_lh_refresh_audit_table', array( $this, 'ajax_refresh_audit_table' ) );
 	}
 
 	/**
@@ -169,10 +170,10 @@ class Link_Healer_Admin {
 		}
 
 		foreach ( $broken_links as $link ) {
-			// Check if the old raw URL is no longer present in the post content
-			if ( strpos( $post->post_content, $link->raw_url ) === false ) {
+			// Check if the old target URL is no longer present in the post content
+			if ( strpos( $post->post_content, $link->target_url ) === false ) {
 				// Also check that it's not present in its escaped form
-				if ( strpos( $post->post_content, esc_url( $link->raw_url ) ) === false ) {
+				if ( strpos( $post->post_content, esc_url( $link->target_url ) ) === false ) {
 					// The link was swapped/removed! Mark as fixed.
 					$wpdb->update(
 						$table_links,
@@ -199,7 +200,8 @@ class Link_Healer_Admin {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'link-healer' ) ), 403 );
 		}
 
-		$link_id = isset( $_POST['link_id'] ) ? intval( $_POST['link_id'] ) : 0;
+		// Safely handle both link_id and id parameters
+		$link_id = isset( $_POST['link_id'] ) ? intval( $_POST['link_id'] ) : ( isset( $_POST['id'] ) ? intval( $_POST['id'] ) : 0 );
 		$new_url = isset( $_POST['new_url'] ) ? esc_url_raw( trim( $_POST['new_url'] ) ) : '';
 
 		if ( ! $link_id || empty( $new_url ) ) {
@@ -233,10 +235,10 @@ class Link_Healer_Admin {
 			// Replace both raw and esc_url occurrences of the link inside href tags
 			$new_content = str_replace(
 				array(
-					'href="' . esc_url( $link->raw_url ) . '"',
-					'href=\'' . esc_url( $link->raw_url ) . '\'',
-					'href="' . $link->raw_url . '"',
-					'href=\'' . $link->raw_url . '\'',
+					'href="' . esc_url( $link->target_url ) . '"',
+					'href=\'' . esc_url( $link->target_url ) . '\'',
+					'href="' . $link->target_url . '"',
+					'href=\'' . $link->target_url . '\'',
 				),
 				array(
 					'href="' . esc_url( $new_url ) . '"',
@@ -261,8 +263,8 @@ class Link_Healer_Admin {
 					wp_send_json_error( array( 'message' => sprintf( __( 'WordPress failed to update post: %s', 'link-healer' ), $update_result->get_error_message() ) ) );
 				}
 			} else {
-				// Fallback string check: if it failed to match exact href quotes, attempt a raw find-and-replace
-				$new_content = str_replace( $link->raw_url, $new_url, $old_content );
+				// Fallback string check
+				$new_content = str_replace( $link->target_url, $new_url, $old_content );
 				if ( $old_content !== $new_content ) {
 					wp_update_post(
 						array(
@@ -276,16 +278,16 @@ class Link_Healer_Admin {
 			}
 		} else {
 			// Homepage, Taxonomy Terms, or custom links
-			wp_send_json_error( array( 'message' => __( 'This link exists on a non-post page (like a term archive or template) and must be fixed manually.', 'link-healer' ) ), 400 );
+			wp_send_json_error( array( 'message' => __( 'This link exists on a non-post page and must be fixed manually.', 'link-healer' ) ), 400 );
 		}
 
-		// Update tracking table row to mark as fixed
+		// Update tracking table row to mark as fixed using new suggested_fix_url field
 		$wpdb->update(
 			$table_links,
 			array(
-				'status'        => 'fixed',
-				'suggested_fix' => $new_url,
-				'last_checked'  => current_time( 'mysql' ),
+				'status'            => 'fixed',
+				'suggested_fix_url' => $new_url,
+				'last_checked'      => current_time( 'mysql' ),
 			),
 			array( 'id' => $link_id ),
 			array( '%s', '%s', '%s' ),
@@ -295,11 +297,33 @@ class Link_Healer_Admin {
 		$ajax_data = $this->get_ajax_dashboard_data();
 		wp_send_json_success(
 			array(
-				'message'    => __( 'Link successfully healed and updated!', 'link-healer' ),
-				'kpis'       => $ajax_data['kpis'],
-				'table_html' => $ajax_data['table_html'],
+				'message' => __( 'Link successfully healed and updated!', 'link-healer' ),
+				'metrics' => array(
+					'total_scanned'   => $ajax_data['kpis']['scanned'],
+					'broken_internal' => $ajax_data['kpis']['broken_int'],
+					'broken_external' => $ajax_data['kpis']['broken_ext'],
+					'total_healed'    => $ajax_data['kpis']['healed'],
+				),
+				'html'    => $ajax_data['table_html'],
 			)
 		);
+	}
+
+	/**
+	 * AJAX Handler: Dynamic refresh of audit list table body.
+	 */
+	public function ajax_refresh_audit_table() {
+		check_ajax_referer( 'link_healer_admin_action', 'nonce' );
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'link-healer' ) ), 403 );
+		}
+
+		ob_start();
+		$this->render_table_rows_only();
+		$html = ob_get_clean();
+
+		wp_send_json_success( array( 'html' => $html ) );
 	}
 
 	/**
@@ -312,13 +336,12 @@ class Link_Healer_Admin {
 		$table_sources = $wpdb->prefix . 'link_healer_sources';
 		$table_links   = $wpdb->prefix . 'link_healer_links';
 
-		// Query KPI metrics with DISTINCT target URLs for mathematical accuracy
-		$scanned_links   = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status != 'unchecked'" );
-		$broken_internal = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'broken' AND link_type = 'internal'" );
-		$broken_external = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'broken' AND link_type = 'external'" );
-		$healed_links    = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'fixed'" );
+		// Query KPI metrics using DISTINCT target_url and the updated column names
+		$scanned_links   = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status != 'unchecked'" );
+		$broken_internal = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'broken' AND is_internal = 1" );
+		$broken_external = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'broken' AND is_internal = 0" );
+		$healed_links    = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'fixed'" );
 
-		// Render the table body and pagination container into a buffer
 		ob_start();
 		$this->render_table_content();
 		$table_html = ob_get_clean();
@@ -332,6 +355,81 @@ class Link_Healer_Admin {
 			),
 			'table_html' => $table_html,
 		);
+	}
+
+	/**
+	 * Helper: Render only raw table rows (tbody content) for refresh.
+	 */
+	public function render_table_rows_only() {
+		global $wpdb;
+		$table_sources = $wpdb->prefix . 'link_healer_sources';
+		$table_links   = $wpdb->prefix . 'link_healer_links';
+
+		// Setup Table Pagination
+		$per_page     = 10;
+		$current_page = isset( $_GET['paged'] ) ? max( 1, intval( $_GET['paged'] ) ) : 1;
+		$offset       = ( $current_page - 1 ) * $per_page;
+
+		// Fetch broken links alongside their source metadata using new columns
+		$query = $wpdb->prepare(
+			"SELECT l.*, s.source_url, s.source_type, s.post_id 
+			 FROM $table_links l 
+			 JOIN $table_sources s ON l.source_id = s.id 
+			 WHERE l.status = 'broken'
+			 ORDER BY l.last_checked DESC 
+			 LIMIT %d OFFSET %d",
+			$per_page,
+			$offset
+		);
+		$broken_links_list = $wpdb->get_results( $query );
+
+		if ( empty( $broken_links_list ) ) {
+			?>
+			<tr>
+				<td colspan="6">
+					<div class="link-healer-empty-state">
+						<div class="link-healer-empty-state-icon">🎉</div>
+						<p><?php esc_html_e( 'Awesome! No broken links found on your site.', 'link-healer' ); ?></p>
+					</div>
+				</td>
+			</tr>
+			<?php
+			return;
+		}
+
+		foreach ( $broken_links_list as $row ) {
+			$edit_url = '';
+			if ( $row->post_id > 0 ) {
+				$edit_url = get_edit_post_link( $row->post_id );
+			}
+			if ( ! empty( $edit_url ) ) {
+				$source_name = '<a href="' . esc_url( $edit_url ) . '" class="link-healer-source-title" target="_blank">' . esc_html( get_the_title( $row->post_id ) ) . '</a>';
+			} else {
+				$source_name = '<a href="' . esc_url( $row->source_url ) . '" class="link-healer-source-title" target="_blank">';
+				if ( 'homepage' === $row->source_type ) {
+					$source_name .= __( 'Homepage', 'link-healer' );
+				} else {
+					$source_name .= esc_html( basename( $row->source_url ) );
+				}
+				$source_name .= '</a>';
+			}
+			?>
+			<tr>
+				<td><input type="checkbox" name="bulk_items[]" value="<?php echo intval( $row->id ); ?>"></td>
+				<td>
+					<?php echo $source_name; ?>
+					<div style="font-size:11px; color:#64748b;"><?php echo esc_html( get_post_type( $row->post_id ) ); ?></div>
+				</td>
+				<td style="word-break: break-all; max-width: 300px;">
+					<span style="color:#ef4444; font-weight:500;"><?php echo esc_html( $row->target_url ); ?></span>
+					<div style="font-size: 11px; color: #94a3b8; margin-top:3px;"><?php echo $row->is_internal ? 'internal' : 'external'; ?></div>
+				</td>
+				<td><span style="background: rgba(239, 68, 68, 0.1); color: #ef4444; padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size:12px;"><?php echo intval( $row->http_status ); ?></span></td>
+				<td><input type="text" class="suggested-fix-input" style="width:100%; border:1px solid #cbd5e1; border-radius:4px; padding: 4px 8px;" value="<?php echo esc_url( $row->suggested_fix_url ); ?>" placeholder="https://..."></td>
+				<td><button class="button button-primary heal-single-btn" data-id="<?php echo intval( $row->id ); ?>">Heal Link</button></td>
+			</tr>
+			<?php
+		}
 	}
 
 	/**
@@ -349,104 +447,21 @@ class Link_Healer_Admin {
 
 		$total_items = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'broken'" );
 		$num_pages   = ceil( $total_items / $per_page );
-
-		// Fetch broken links alongside their source metadata
-		$query = $wpdb->prepare(
-			"SELECT l.*, s.source_url, s.source_type, s.post_id 
-			 FROM $table_links l 
-			 JOIN $table_sources s ON l.source_id = s.id 
-			 WHERE l.status = 'broken'
-			 ORDER BY l.last_checked DESC 
-			 LIMIT %d OFFSET %d",
-			$per_page,
-			$offset
-		);
-		$broken_links_list = $wpdb->get_results( $query );
 		?>
 		<div class="link-healer-table-wrapper">
-			<table class="link-healer-table">
+			<table class="link-healer-table wp-list-table">
 				<thead>
 					<tr>
-						<th class="link-healer-col-cb"><input type="checkbox" id="link-healer-select-all" /></th>
+						<th class="link-healer-col-cb" style="width: 30px;"><input type="checkbox" id="link-healer-select-all" /></th>
 						<th class="link-healer-col-source"><?php esc_html_e( 'Source Page', 'link-healer' ); ?></th>
 						<th class="link-healer-col-target"><?php esc_html_e( 'Broken Target URL', 'link-healer' ); ?></th>
 						<th class="link-healer-col-status"><?php esc_html_e( 'HTTP Status', 'link-healer' ); ?></th>
 						<th class="link-healer-col-suggestion"><?php esc_html_e( 'Smart Suggestion', 'link-healer' ); ?></th>
-						<th style="text-align:right;"><?php esc_html_e( 'Actions', 'link-healer' ); ?></th>
+						<th style="text-align:right; width: 100px;"><?php esc_html_e( 'Actions', 'link-healer' ); ?></th>
 					</tr>
 				</thead>
-				<tbody>
-					<?php if ( empty( $broken_links_list ) ) : ?>
-						<tr>
-							<td colspan="6">
-								<div class="link-healer-empty-state">
-									<div class="link-healer-empty-state-icon">🎉</div>
-									<p><?php esc_html_e( 'Awesome! No broken links found on your site.', 'link-healer' ); ?></p>
-								</div>
-							</td>
-						</tr>
-					<?php else : ?>
-						<?php foreach ( $broken_links_list as $link ) : ?>
-							<tr id="link-row-<?php echo esc_attr( $link->id ); ?>">
-								<td class="link-healer-col-cb">
-									<input type="checkbox" class="link-row-cb" value="<?php echo esc_attr( $link->id ); ?>" />
-								</td>
-								<td class="link-healer-col-source">
-									<?php
-									$edit_url = '';
-									if ( $link->post_id > 0 ) {
-										$edit_url = get_edit_post_link( $link->post_id );
-									}
-									if ( ! empty( $edit_url ) ) :
-										?>
-										<a href="<?php echo esc_url( $edit_url ); ?>" class="link-healer-source-title" target="_blank">
-											<?php echo esc_html( get_the_title( $link->post_id ) ); ?>
-										</a>
-									<?php else : ?>
-										<a href="<?php echo esc_url( $link->source_url ); ?>" class="link-healer-source-title" target="_blank">
-											<?php
-											if ( 'homepage' === $link->source_type ) {
-												esc_html_e( 'Homepage', 'link-healer' );
-											} else {
-												echo esc_html( basename( $link->source_url ) );
-											}
-											?>
-										</a>
-									<?php endif; ?>
-									<span class="link-healer-source-meta">
-										<?php echo esc_html( str_replace( '_', ' ', $link->source_type ) ); ?>
-									</span>
-								</td>
-								<td class="link-healer-col-target">
-									<div class="link-healer-target-url"><?php echo esc_html( $link->raw_url ); ?></div>
-									<span class="link-healer-source-meta" style="font-size:10px;">
-										<?php echo esc_html( $link->link_type ); ?>
-									</span>
-								</td>
-								<td class="link-healer-col-status">
-									<span class="link-healer-badge status-broken">
-										<?php echo esc_html( $link->http_status ? $link->http_status : '404' ); ?>
-									</span>
-								</td>
-								<td class="link-healer-col-suggestion">
-									<div class="link-healer-suggestion-wrapper">
-										<input type="text" 
-											   class="link-healer-suggestion-input" 
-											   data-link-id="<?php echo esc_attr( $link->id ); ?>" 
-											   value="<?php echo esc_attr( $link->suggested_fix ); ?>" 
-											   placeholder="http://..." />
-									</div>
-								</td>
-								<td style="text-align:right;">
-									<button class="link-healer-btn link-healer-btn-primary link-healer-heal-btn" 
-											data-link-id="<?php echo esc_attr( $link->id ); ?>" 
-											style="font-size: 11px; padding: 6px 12px; border-radius:6px;">
-										<?php esc_html_e( 'Heal Link', 'link-healer' ); ?>
-									</button>
-								</td>
-							</tr>
-						<?php endforeach; ?>
-					<?php endif; ?>
+				<tbody id="lh-audit-table-body">
+					<?php $this->render_table_rows_only(); ?>
 				</tbody>
 			</table>
 		</div>
@@ -501,11 +516,11 @@ class Link_Healer_Admin {
 			return;
 		}
 
-		// Query KPI metrics with DISTINCT target URLs for exact mathematical accuracy
-		$scanned_links   = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status != 'unchecked'" );
-		$broken_internal = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'broken' AND link_type = 'internal'" );
-		$broken_external = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'broken' AND link_type = 'external'" );
-		$healed_links    = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT raw_url) FROM $table_links WHERE status = 'fixed'" );
+		// Query KPI metrics using DISTINCT target_url and the updated column names
+		$scanned_links   = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status != 'unchecked'" );
+		$broken_internal = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'broken' AND is_internal = 1" );
+		$broken_external = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'broken' AND is_internal = 0" );
+		$healed_links    = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT target_url) FROM $table_links WHERE status = 'fixed'" );
 
 		// Settings redirect feedback
 		if ( isset( $_GET['settings-updated'] ) && 'true' === $_GET['settings-updated'] ) {
@@ -533,19 +548,19 @@ class Link_Healer_Admin {
 				<div class="link-healer-kpi-grid">
 					<div class="link-healer-kpi-card scanned">
 						<div class="link-healer-kpi-title"><?php esc_html_e( 'Total Scanned Links', 'link-healer' ); ?></div>
-						<div class="link-healer-kpi-value" id="link-healer-count-scanned"><?php echo esc_html( $scanned_links ); ?></div>
+						<div class="link-healer-kpi-value" id="scanned-count"><?php echo esc_html( $scanned_links ); ?></div>
 					</div>
 					<div class="link-healer-kpi-card broken-int">
 						<div class="link-healer-kpi-title"><?php esc_html_e( 'Broken Internal Links', 'link-healer' ); ?></div>
-						<div class="link-healer-kpi-value" id="link-healer-count-broken-int"><?php echo esc_html( $broken_internal ); ?></div>
+						<div class="link-healer-kpi-value" id="internal-count"><?php echo esc_html( $broken_internal ); ?></div>
 					</div>
 					<div class="link-healer-kpi-card broken-ext">
 						<div class="link-healer-kpi-title"><?php esc_html_e( 'Broken External Links', 'link-healer' ); ?></div>
-						<div class="link-healer-kpi-value" id="link-healer-count-broken-ext"><?php echo esc_html( $broken_external ); ?></div>
+						<div class="link-healer-kpi-value" id="external-count"><?php echo esc_html( $broken_external ); ?></div>
 					</div>
 					<div class="link-healer-kpi-card healed">
 						<div class="link-healer-kpi-title"><?php esc_html_e( 'Total Healed Links', 'link-healer' ); ?></div>
-						<div class="link-healer-kpi-value" id="link-healer-count-healed"><?php echo esc_html( $healed_links ); ?></div>
+						<div class="link-healer-kpi-value" id="healed-count"><?php echo esc_html( $healed_links ); ?></div>
 					</div>
 				</div>
 
@@ -559,25 +574,9 @@ class Link_Healer_Admin {
 						<button id="link-healer-trigger-crawl" class="link-healer-btn link-healer-btn-secondary">
 							<span class="dashicons dashicons-update" style="margin-top:2px;"></span> <?php esc_html_e( 'Crawl Pending Links', 'link-healer' ); ?>
 						</button>
-						<button id="link-healer-cancel-crawl" class="link-healer-btn link-healer-btn-danger" style="display:none;">
-							<span class="dashicons dashicons-dismiss" style="margin-top:2px;"></span> <?php esc_html_e( 'Cancel Crawl', 'link-healer' ); ?>
-						</button>
 						<button id="link-healer-reset-data" class="link-healer-btn link-healer-btn-danger">
 							<span class="dashicons dashicons-trash" style="margin-top:2px;"></span> <?php esc_html_e( 'Reset Database', 'link-healer' ); ?>
 						</button>
-					</div>
-					<!-- Progress Tracker Container -->
-					<div id="link-healer-progress-container" style="display:none; margin-top: 15px; padding: 15px; background: rgba(0,0,0,0.02); border-radius: 8px;">
-						<div style="display: flex; justify-content: space-between; margin-bottom: 5px; font-weight: 500;">
-							<span id="link-healer-progress-label">Crawling...</span>
-							<span id="link-healer-progress-percentage">0%</span>
-						</div>
-						<div style="width: 100%; height: 10px; background: rgba(0,0,0,0.05); border-radius: 5px; overflow: hidden;">
-							<div id="link-healer-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%); transition: width 0.3s ease;"></div>
-						</div>
-						<div id="link-healer-progress-details" style="margin-top: 5px; font-size: 11px; opacity: 0.7;">
-							Remaining: 0 | Total: 0
-						</div>
 					</div>
 				</div>
 

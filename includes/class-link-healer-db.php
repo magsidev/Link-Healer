@@ -1,6 +1,6 @@
 <?php
 /**
- * Database operations class for Link Healer.
+ * Database schema and connection wrapper for Link Healer.
  */
 
 // Prevent direct access.
@@ -35,7 +35,7 @@ class Link_Healer_DB {
 	private function __construct() {}
 
 	/**
-	 * Install/create database tables on plugin activation.
+	 * Install custom tables.
 	 */
 	public static function install() {
 		global $wpdb;
@@ -45,7 +45,6 @@ class Link_Healer_DB {
 		$table_links     = $wpdb->prefix . 'link_healer_links';
 
 		// wp_link_healer_sources table SQL.
-		// Note the double spaces before PRIMARY KEY and KEY definitions as required by dbDelta.
 		$sql_sources = "CREATE TABLE $table_sources (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
 			post_id bigint(20) unsigned DEFAULT NULL,
@@ -60,20 +59,20 @@ class Link_Healer_DB {
 			KEY source_url (source_url(191))
 		) $charset_collate;";
 
-		// wp_link_healer_links table SQL.
+		// wp_link_healer_links table SQL using new column names.
 		$sql_links = "CREATE TABLE $table_links (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
 			source_id bigint(20) unsigned NOT NULL,
-			raw_url varchar(2083) NOT NULL,
+			target_url varchar(2083) NOT NULL,
 			url_hash char(32) NOT NULL,
-			link_type varchar(20) NOT NULL,
+			is_internal tinyint(1) NOT NULL DEFAULT 0,
 			http_status int(5) DEFAULT NULL,
 			status varchar(20) DEFAULT 'unchecked' NOT NULL,
 			anchor_text text DEFAULT NULL,
-			suggested_fix varchar(2083) DEFAULT NULL,
+			suggested_fix_url varchar(2083) DEFAULT NULL,
 			last_checked datetime DEFAULT NULL,
 			PRIMARY KEY  (id),
-			UNIQUE KEY unique_link (source_id, raw_url(191)),
+			UNIQUE KEY unique_link (source_id, target_url(191)),
 			KEY source_id (source_id),
 			KEY status (status),
 			KEY url_hash (url_hash),
@@ -97,10 +96,8 @@ class Link_Healer_DB {
 		global $wpdb;
 		$table = $wpdb->prefix . 'link_healer_sources';
 
-		// Clean and trim URL.
 		$source_url = esc_url_raw( trim( $source_url ) );
 
-		// Check if it already exists to prevent duplicate sources.
 		$existing_id = $wpdb->get_var( $wpdb->prepare(
 			"SELECT id FROM $table WHERE source_url = %s",
 			$source_url
@@ -155,19 +152,18 @@ class Link_Healer_DB {
 	 * Insert/update link details under a specific source.
 	 *
 	 * @param int    $source_id
-	 * @param string $raw_url
-	 * @param string $link_type
+	 * @param string $target_url
+	 * @param int    $is_internal (1 for internal, 0 for external)
 	 * @param string $anchor_text
 	 * @return int Link ID
 	 */
-	public function save_link( $source_id, $raw_url, $link_type, $anchor_text ) {
+	public function save_link( $source_id, $target_url, $is_internal, $anchor_text ) {
 		global $wpdb;
 		$table = $wpdb->prefix . 'link_healer_links';
 
-		$raw_url  = esc_url_raw( trim( $raw_url ) );
-		$url_hash = md5( $raw_url );
+		$target_url = esc_url_raw( trim( $target_url ) );
+		$url_hash   = md5( $target_url );
 
-		// Check if this source already has this exact link recorded.
 		$existing_id = $wpdb->get_var( $wpdb->prepare(
 			"SELECT id FROM $table WHERE source_id = %d AND url_hash = %s",
 			(int) $source_id,
@@ -175,7 +171,6 @@ class Link_Healer_DB {
 		) );
 
 		if ( $existing_id ) {
-			// Update the anchor text context in case it changed.
 			$wpdb->update(
 				$table,
 				array( 'anchor_text' => wp_kses_post( $anchor_text ) ),
@@ -190,9 +185,9 @@ class Link_Healer_DB {
 			$table,
 			array(
 				'source_id'   => (int) $source_id,
-				'raw_url'     => $raw_url,
+				'target_url'  => $target_url,
 				'url_hash'    => $url_hash,
-				'link_type'   => sanitize_key( $link_type ),
+				'is_internal' => (int) $is_internal,
 				'status'      => 'unchecked',
 				'anchor_text' => wp_kses_post( $anchor_text ),
 			),
@@ -200,7 +195,7 @@ class Link_Healer_DB {
 				'%d',
 				'%s',
 				'%s',
-				'%s',
+				'%d',
 				'%s',
 				'%s',
 			)
@@ -215,19 +210,19 @@ class Link_Healer_DB {
 	 * @param int    $link_id
 	 * @param int    $http_status
 	 * @param string $status
-	 * @param string $suggested_fix
+	 * @param string $suggested_fix_url
 	 */
-	public function update_link_status( $link_id, $http_status, $status, $suggested_fix = '' ) {
+	public function update_link_status( $link_id, $http_status, $status, $suggested_fix_url = '' ) {
 		global $wpdb;
 		$table = $wpdb->prefix . 'link_healer_links';
 
 		$wpdb->update(
 			$table,
 			array(
-				'http_status'   => (int) $http_status,
-				'status'        => sanitize_key( $status ),
-				'suggested_fix' => esc_url_raw( $suggested_fix ),
-				'last_checked'  => current_time( 'mysql' ),
+				'http_status'       => (int) $http_status,
+				'status'            => sanitize_key( $status ),
+				'suggested_fix_url' => esc_url_raw( $suggested_fix_url ),
+				'last_checked'      => current_time( 'mysql' ),
 			),
 			array( 'id' => (int) $link_id ),
 			array( '%d', '%s', '%s', '%s' ),
@@ -246,12 +241,10 @@ class Link_Healer_DB {
 		$table = $wpdb->prefix . 'link_healer_links';
 
 		if ( empty( $current_link_hashes ) ) {
-			// If no links were found in the latest scan, delete all links for this source.
 			$wpdb->delete( $table, array( 'source_id' => (int) $source_id ), array( '%d' ) );
 			return;
 		}
 
-		// Prepare placeholders for SQL IN clause.
 		$placeholders = implode( ',', array_fill( 0, count( $current_link_hashes ), '%s' ) );
 		$query        = $wpdb->prepare(
 			"DELETE FROM $table WHERE source_id = %d AND url_hash NOT IN ($placeholders)",

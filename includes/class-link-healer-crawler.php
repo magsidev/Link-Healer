@@ -1,6 +1,6 @@
 <?php
 /**
- * HTML Crawler and Link Validator for Link Healer.
+ * Crawler and link extractor for Link Healer.
  */
 
 // Prevent direct access.
@@ -35,7 +35,7 @@ class Link_Healer_Crawler {
 	private function __construct() {}
 
 	/**
-	 * Crawl a single source URL, extract links, save them, and clean up orphaned links.
+	 * Crawl a single source URL, extract links, and update database.
 	 *
 	 * @param int $source_id DB ID from wp_link_healer_sources.
 	 * @return bool True on success, false on failure.
@@ -61,7 +61,7 @@ class Link_Healer_Crawler {
 		$response = wp_remote_get( $source->source_url, array(
 			'timeout'    => 20,
 			'user-agent' => 'LinkHealerBot/1.0; ' . home_url(),
-			'sslverify'  => false, // Avoid SSL verification errors on local staging environments.
+			'sslverify'  => false,
 		) );
 
 		if ( is_wp_error( $response ) ) {
@@ -88,13 +88,13 @@ class Link_Healer_Crawler {
 		$current_link_hashes = array();
 
 		foreach ( $extracted_links as $link ) {
-			$raw_url     = $link['url'];
+			$target_url  = $link['url'];
 			$anchor_text = $link['anchor'];
-			$link_type   = $this->classify_link_type( $raw_url );
+			$is_internal = $this->classify_link_type( $target_url );
 
-			$link_id = $db->save_link( $source_id, $raw_url, $link_type, $anchor_text );
+			$link_id = $db->save_link( $source_id, $target_url, $is_internal, $anchor_text );
 			if ( $link_id ) {
-				$current_link_hashes[] = md5( esc_url_raw( trim( $raw_url ) ) );
+				$current_link_hashes[] = md5( esc_url_raw( trim( $target_url ) ) );
 			}
 		}
 
@@ -118,9 +118,7 @@ class Link_Healer_Crawler {
 
 		if ( class_exists( 'DOMDocument' ) ) {
 			$dom = new DOMDocument();
-			// Suppress parsing errors for invalid HTML5 markup.
 			libxml_use_internal_errors( true );
-			// Load with UTF-8 encoding support.
 			@$dom->loadHTML( '<?xml encoding="UTF-8">' . $html );
 			libxml_clear_errors();
 
@@ -185,23 +183,23 @@ class Link_Healer_Crawler {
 		$checked = 0;
 
 		foreach ( $links as $link ) {
-			$status_code = $this->ping_url( $link->raw_url );
+			$status_code = $this->ping_url( $link->target_url );
 
-			$status        = 'healthy';
-			$suggested_fix = '';
+			$status             = 'healthy';
+			$suggested_fix_url  = '';
 
 			if ( 403 === $status_code || 503 === $status_code ) {
 				$status = 'blocked';
 			} elseif ( $status_code === 0 || $status_code >= 400 ) {
 				$status = 'broken';
 				if ( 404 === $status_code ) {
-					$suggested_fix = Link_Healer_Matcher::get_instance()->get_best_match( $link->raw_url );
+					$suggested_fix_url = Link_Healer_Matcher::get_instance()->get_best_match( $link->target_url );
 				}
 			} elseif ( $status_code >= 200 && $status_code < 400 ) {
 				$status = 'healthy';
 			}
 
-			$db->update_link_status( $link->id, $status_code, $status, $suggested_fix );
+			$db->update_link_status( $link->id, $status_code, $status, $suggested_fix_url );
 			$checked++;
 		}
 
@@ -259,8 +257,10 @@ class Link_Healer_Crawler {
 			return false;
 		}
 
-		// Filter out JavaScript, anchors, phone numbers, and mail links.
-		if ( preg_match( '/^(javascript:|#|mailto:|tel:|sms:|whatsapp:|skype:|callto:)/i', $href ) ) {
+		// Skip anchors, JavaScript voids, mailto, tel, sms, and feed URIs.
+		if ( strpos( $href, '#' ) === 0 || stripos( $href, 'javascript:' ) === 0 ||
+			stripos( $href, 'mailto:' ) === 0 || stripos( $href, 'tel:' ) === 0 ||
+			stripos( $href, 'sms:' ) === 0 || stripos( $href, 'feed:' ) === 0 ) {
 			return false;
 		}
 
@@ -268,98 +268,52 @@ class Link_Healer_Crawler {
 	}
 
 	/**
-	 * Classify URL as internal or external.
+	 * Classify link URL as internal or external.
 	 *
-	 * @param string $url Link target.
-	 * @return string 'internal' or 'external'.
+	 * @param string $url Link URL.
+	 * @return int 1 if internal, 0 if external.
 	 */
 	private function classify_link_type( $url ) {
-		$site_host   = wp_parse_url( home_url(), PHP_URL_HOST );
-		$target_host = wp_parse_url( $url, PHP_URL_HOST );
+		$home_host = wp_parse_url( home_url(), PHP_URL_HOST );
+		$link_host = wp_parse_url( $url, PHP_URL_HOST );
 
-		if ( ! $target_host || strcasecmp( $site_host, $target_host ) === 0 ) {
-			return 'internal';
+		if ( empty( $link_host ) || $link_host === $home_host ) {
+			return 1; // internal
 		}
 
-		return 'external';
+		return 0; // external
 	}
 
 	/**
-	 * Resolve relative paths and root-relative paths to absolute URLs.
+	 * Resolve relative URLs to absolute based on the base crawling page.
 	 *
-	 * @param string $url Link href target.
-	 * @param string $base_url Parent Page URL.
-	 * @return string Absolute URL.
+	 * @param string $url Relative or absolute URL.
+	 * @param string $base Base URL of current page.
+	 * @return string Absolute resolved URL or empty on error.
 	 */
-	private function resolve_relative_url( $url, $base_url ) {
-		// If already absolute URL.
-		if ( preg_match( '/^https?:\/\//i', $url ) ) {
+	private function resolve_relative_url( $url, $base ) {
+		// If already absolute.
+		if ( parse_url( $url, PHP_URL_SCHEME ) != '' ) {
 			return $url;
 		}
 
-		// Protocol-relative URL.
-		if ( strpos( $url, '//' ) === 0 ) {
-			$protocol = wp_parse_url( $base_url, PHP_URL_SCHEME );
-			return $protocol ? $protocol . ':' . $url : 'http:' . $url;
+		$base_parts = parse_url( $base );
+		if ( ! isset( $base_parts['host'] ) ) {
+			return '';
 		}
 
-		$base_parts = wp_parse_url( $base_url );
-		$host_base  = $base_parts['scheme'] . '://' . $base_parts['host'];
-		if ( isset( $base_parts['port'] ) ) {
-			$host_base .= ':' . $base_parts['port'];
-		}
-
-		// Root-relative path.
+		// Absolute path on host.
 		if ( strpos( $url, '/' ) === 0 ) {
-			return $host_base . $url;
+			return ( isset( $base_parts['scheme'] ) ? $base_parts['scheme'] : 'http' ) . '://' . $base_parts['host'] . $url;
 		}
 
-		// Relative path or query query string.
-		if ( strpos( $url, '?' ) === 0 || strpos( $url, '#' ) === 0 ) {
-			$path = isset( $base_parts['path'] ) ? $base_parts['path'] : '';
-			return $host_base . $path . $url;
-		}
-
-		// Simple relative file path resolution.
-		$path = isset( $base_parts['path'] ) ? $base_parts['path'] : '/';
+		// Relative path.
+		$path = isset( $base_parts['path'] ) ? $base_parts['path'] : '';
 		$dir  = dirname( $path );
-		if ( $dir === '.' || $dir === '\\' ) {
-			$dir = '/';
-		} else {
-			$dir = rtrim( $dir, '/' ) . '/';
+		if ( '.' === $dir || '/' === $dir ) {
+			$dir = '';
 		}
 
-		return $host_base . $dir . $url;
-	}
-
-	/**
-	 * Find an internal published post slug fallback for a 404 URL.
-	 *
-	 * @param string $url The broken internal URL.
-	 * @return string Suggested correct URL, or empty string.
-	 */
-	private function find_internal_fallback_suggestion( $url ) {
-		$path = wp_parse_url( $url, PHP_URL_PATH );
-		if ( ! $path ) {
-			return '';
-		}
-
-		$slug = basename( $path );
-		if ( empty( $slug ) ) {
-			return '';
-		}
-
-		// Try matching slug in database.
-		global $wpdb;
-		$post_id = $wpdb->get_var( $wpdb->prepare(
-			"SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 1",
-			sanitize_title( $slug )
-		) );
-
-		if ( $post_id ) {
-			return get_permalink( $post_id );
-		}
-
-		return '';
+		return ( isset( $base_parts['scheme'] ) ? $base_parts['scheme'] : 'http' ) . '://' . $base_parts['host'] . $dir . '/' . $url;
 	}
 }

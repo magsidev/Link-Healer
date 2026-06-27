@@ -1,12 +1,9 @@
 <?php
 /**
  * Plugin Name:       Link Healer
- * Plugin URI:        https://github.com/google/link-healer
- * Description:       Finds and automatically fixes broken internal and external links across posts, pages, CPTs, taxonomies, and page builders.
+ * Description:       Automatically finds, validates, and heals broken links on page and Gutenberg canvas.
  * Version:           1.0.0
- * Author:            WordPress Core and Database Engineer
- * Author URI:        https://github.com/google/link-healer
- * License:           GPL2
+ * Author:            Antigravity AI
  * Text Domain:       link-healer
  */
 
@@ -15,33 +12,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-// Define plugin constants.
+// Define core plugin constants.
 define( 'LINK_HEALER_VERSION', '1.0.0' );
 define( 'LINK_HEALER_FILE', __FILE__ );
 define( 'LINK_HEALER_PATH', plugin_dir_path( __FILE__ ) );
 define( 'LINK_HEALER_URL', plugin_dir_url( __FILE__ ) );
-define( 'LINK_HEALER_INC', LINK_HEALER_PATH . 'includes/' );
 
-// Register the PSR-4/WordPress custom autoloader.
-spl_autoload_register( function ( $class_name ) {
-	// Only load classes starting with Link_Healer_
-	if ( strpos( $class_name, 'Link_Healer_' ) !== 0 ) {
-		return;
-	}
-
-	// Convert Link_Healer_Class_Name to class-link-healer-class-name.php
-	$relative_class = substr( $class_name, 12 );
-	$file_name      = 'class-link-healer-' . str_replace( '_', '-', strtolower( $relative_class ) ) . '.php';
-	$file_path      = LINK_HEALER_INC . $file_name;
-
-	if ( file_exists( $file_path ) ) {
-		require_once $file_path;
-	}
-} );
-
-/**
- * Main plugin class.
- */
 class Link_Healer {
 
 	/**
@@ -67,16 +43,38 @@ class Link_Healer {
 	 * Constructor.
 	 */
 	private function __construct() {
-		// Initialize the plugin logic when plugins are loaded.
-		add_action( 'plugins_loaded', array( $this, 'init_plugin' ) );
+		$this->autoload_classes();
+		add_action( 'init', array( $this, 'init_plugin' ) );
 	}
 
 	/**
-	 * Initialize components.
+	 * Simple PSR-4 Autoloader implementation matching file prefix convention.
+	 */
+	private function autoload_classes() {
+		spl_autoload_register( function ( $class_name ) {
+			// Only autoload Link Healer classes
+			if ( strpos( $class_name, 'Link_Healer_' ) !== 0 ) {
+				return;
+			}
+
+			// Convert CamelCase/Underscores to lowercase hyphens matching prefix
+			$file_part = strtolower( str_replace( '_', '-', substr( $class_name, 12 ) ) );
+			$file_path = LINK_HEALER_PATH . 'includes/class-link-healer-' . $file_part . '.php';
+
+			if ( file_exists( $file_path ) ) {
+				require_once $file_path;
+			}
+		} );
+	}
+
+	/**
+	 * Initialize components and AJAX hooks.
 	 */
 	public function init_plugin() {
-		// Instantiate DB hooks and background cron managers.
+		// Initialize databases
 		Link_Healer_DB::get_instance();
+
+		// Trigger background systems
 		Link_Healer_Cron::get_instance();
 		Link_Healer_Discovery::get_instance();
 		Link_Healer_Crawler::get_instance();
@@ -87,11 +85,11 @@ class Link_Healer {
 			Link_Healer_Admin::get_instance();
 		}
 
-		// Add Admin AJAX hooks for manual trigger/status checks.
-		add_action( 'wp_ajax_link_healer_trigger_discovery', array( $this, 'ajax_trigger_discovery' ) );
-		add_action( 'wp_ajax_link_healer_trigger_crawl', array( $this, 'ajax_trigger_crawl' ) );
-		add_action( 'wp_ajax_link_healer_get_status', array( $this, 'ajax_get_status' ) );
-		add_action( 'wp_ajax_link_healer_reset_data', array( $this, 'ajax_reset_data' ) );
+		// Add Admin AJAX hooks for manual trigger/status checks (lh_ prefixed)
+		add_action( 'wp_ajax_lh_discover_urls', array( $this, 'ajax_trigger_discovery' ) );
+		add_action( 'wp_ajax_lh_crawl_batch', array( $this, 'ajax_trigger_crawl' ) );
+		add_action( 'wp_ajax_lh_get_crawl_stats', array( $this, 'ajax_get_crawl_stats' ) );
+		add_action( 'wp_ajax_lh_reset_database', array( $this, 'ajax_reset_data' ) );
 	}
 
 	/**
@@ -116,13 +114,40 @@ class Link_Healer {
 
 		delete_transient( 'link_healer_discovery_lock' );
 
-		$admin_data = Link_Healer_Admin::get_instance()->get_ajax_dashboard_data();
+		global $wpdb;
+		$table_sources = $wpdb->prefix . 'link_healer_sources';
+		$table_links   = $wpdb->prefix . 'link_healer_links';
+
+		$pending_sources = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'pending'" );
+		$unchecked_links = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'unchecked'" );
+		$remaining       = $pending_sources + $unchecked_links;
 
 		wp_send_json_success( array(
-			'message'    => sprintf( __( 'Discovery completed. Found and indexed %d source URLs.', 'link-healer' ), $count ),
-			'count'      => $count,
-			'kpis'       => $admin_data['kpis'],
-			'table_html' => $admin_data['table_html'],
+			'total_sources'     => $count,
+			'remaining_pending' => $remaining,
+			'message'           => sprintf( __( 'Discovery completed. Found and indexed %d source URLs.', 'link-healer' ), $count ),
+		) );
+	}
+
+	/**
+	 * Retrieve remaining crawl statistics for queue initialization.
+	 */
+	public function ajax_get_crawl_stats() {
+		check_ajax_referer( 'link_healer_admin_action', 'nonce' );
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'link-healer' ) ), 403 );
+		}
+
+		global $wpdb;
+		$table_sources = $wpdb->prefix . 'link_healer_sources';
+		$table_links   = $wpdb->prefix . 'link_healer_links';
+
+		$pending_sources = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'pending'" );
+		$unchecked_links = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'unchecked'" );
+		
+		wp_send_json_success( array(
+			'total_pending' => $pending_sources + $unchecked_links,
 		) );
 	}
 
@@ -154,78 +179,27 @@ class Link_Healer {
 		// Get counts after running the batch
 		$pending_sources   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'pending'" );
 		$completed_sources = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'completed'" );
-		$total_sources     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources" );
 
 		$unchecked_links = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'unchecked'" );
 		$checked_links   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status != 'unchecked'" );
-		$total_links     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links" );
 
 		$sources_diff = $completed_sources - $completed_sources_before;
 		$links_diff   = $checked_links - $checked_links_before;
 		
-		$processed_in_batch   = $sources_diff + $links_diff;
-		$remaining_pending    = $pending_sources + $unchecked_links;
+		$processed_in_batch = $sources_diff + $links_diff;
+		$remaining_pending  = $pending_sources + $unchecked_links;
 		
-		// Set total pending at start as the current remaining plus what we processed in this batch, if not tracked on frontend
-		$total_pending_at_start = $remaining_pending + $processed_in_batch;
-
 		$admin_data = Link_Healer_Admin::get_instance()->get_ajax_dashboard_data();
 
 		wp_send_json_success( array(
-			'message'                => sprintf( __( 'Processed batch: %d sources, %d links.', 'link-healer' ), $sources_diff, $links_diff ),
-			'processed_in_batch'     => $processed_in_batch,
-			'remaining_pending'      => $remaining_pending,
-			'total_pending_at_start' => $total_pending_at_start,
-			'pending_sources'        => $pending_sources,
-			'completed_sources'      => $completed_sources,
-			'total_sources'          => $total_sources,
-			'unchecked_links'        => $unchecked_links,
-			'total_links'            => $total_links,
-			'kpis'                   => $admin_data['kpis'],
-			'table_html'             => $admin_data['table_html'],
-		) );
-	}
-
-	/**
-	 * Retrieve current scan progress statistics.
-	 */
-	public function ajax_get_status() {
-		check_ajax_referer( 'link_healer_admin_action', 'nonce' );
-
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'link-healer' ) ), 403 );
-		}
-
-		global $wpdb;
-		$table_sources = $wpdb->prefix . 'link_healer_sources';
-		$table_links   = $wpdb->prefix . 'link_healer_links';
-
-		// Verify tables exist.
-		if ( $wpdb->get_var( "SHOW TABLES LIKE '$table_sources'" ) !== $table_sources ) {
-			wp_send_json_error( array( 'message' => __( 'Database tables not installed.', 'link-healer' ) ) );
-		}
-
-		$total_sources     = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources" );
-		$pending_sources   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'pending'" );
-		$completed_sources = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'completed'" );
-		$failed_sources    = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_sources WHERE status = 'failed'" );
-
-		$total_links   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links" );
-		$broken_links  = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'broken'" );
-		$healthy_links = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table_links WHERE status = 'healthy'" );
-
-		wp_send_json_success( array(
-			'sources' => array(
-				'total'     => $total_sources,
-				'pending'   => $pending_sources,
-				'completed' => $completed_sources,
-				'failed'    => $failed_sources,
-			),
-			'links'   => array(
-				'total'   => $total_links,
-				'broken'  => $broken_links,
-				'healthy' => $healthy_links,
-			),
+			'processed_in_batch' => $processed_in_batch,
+			'remaining_pending'  => $remaining_pending,
+			'metrics'            => array(
+				'total_scanned'   => $admin_data['kpis']['scanned'],
+				'broken_internal' => $admin_data['kpis']['broken_int'],
+				'broken_external' => $admin_data['kpis']['broken_ext'],
+				'total_healed'    => $admin_data['kpis']['healed'],
+			)
 		) );
 	}
 
@@ -246,13 +220,7 @@ class Link_Healer {
 		$wpdb->query( "TRUNCATE TABLE $table_sources" );
 		$wpdb->query( "TRUNCATE TABLE $table_links" );
 
-		$admin_data = Link_Healer_Admin::get_instance()->get_ajax_dashboard_data();
-
-		wp_send_json_success( array(
-			'message'    => __( 'All source URLs and scanned links reset successfully.', 'link-healer' ),
-			'kpis'       => $admin_data['kpis'],
-			'table_html' => $admin_data['table_html'],
-		) );
+		wp_send_json_success( array( 'message' => __( 'All source URLs and scanned links reset successfully.', 'link-healer' ) ) );
 	}
 }
 
